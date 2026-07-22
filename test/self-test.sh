@@ -118,6 +118,11 @@ cat >"$MIRROR/manifest.json" <<EOF
 ]
 EOF
 
+# TEMP-DEBUG: diagnose Windows parse failure
+ls -l "$MIRROR"
+od -c "$MIRROR/manifest.json" | head -12
+od -c "$MIRROR/SHA256SUMS.txt" | head -6
+
 say "setup: stitch lean package"
 echo "FAKE TFS IMAGE PAYLOAD" >"$WORK/app.tfs"
 PKG=$WORK/myapp$EXE
