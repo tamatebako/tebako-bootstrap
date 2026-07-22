@@ -133,7 +133,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p stage
-          BIN=$(find build -name 'tebako-bootstrap*' -type f \( -perm +111 -o -name '*.exe' \) | grep -v tpkg | head -1)
+          BIN=$(find build -type f \( -name tebako-bootstrap -o -name tebako-bootstrap.exe \) | head -1)
           SUFFIX=""
           case "${{ matrix.platform }}" in windows-*) SUFFIX=".exe" ;; esac
           cp "$BIN" "stage/tebako-bootstrap-${{ env.version }}-${{ matrix.platform }}${SUFFIX}"
