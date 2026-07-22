@@ -191,10 +191,11 @@ jobs:
         shell: bash
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "${{ github.repository }}"
           else
             gh release create "$TAG" dist/* \
+              --repo "${{ github.repository }}" \
               --title "tebako-bootstrap ${TAG#v}" \
               --notes "Prebuilt tebako bootstrap launchers. Static on Linux; self-tested on all platforms before publish."
           fi
