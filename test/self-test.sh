@@ -34,7 +34,12 @@ UNAME_S=$(uname -s 2>/dev/null || echo unknown)
 UNAME_M=$(uname -m 2>/dev/null || echo unknown)
 EXE=
 case $UNAME_S in
-  MINGW* | MSYS* | CYGWIN* | Windows_NT) EXE=.exe ;;
+  MINGW* | MSYS* | CYGWIN* | Windows_NT)
+    EXE=.exe
+    # All paths handed to native exes below are already Windows-form; stop
+    # MSYS2 from rewriting "FILE:MOUNT" specs as PATH lists (: -> ;).
+    export MSYS2_ARG_CONV_EXCL='*'
+    ;;
 esac
 
 case $UNAME_S in
