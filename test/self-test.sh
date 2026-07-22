@@ -74,12 +74,14 @@ for f in "$BOOTSTRAP" "$STITCH" "$FAKE"; do
 done
 
 sha256_of() {
+  # GNU coreutils prefixes the line with '\' when the filename needs escaping
+  # (e.g. backslashes in Windows paths) — strip it.
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
+    sha256sum "$1" | cut -d' ' -f1 | sed 's/^\\//'
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | cut -d' ' -f1
+    shasum -a 256 "$1" | cut -d' ' -f1 | sed 's/^\\//'
   else
-    openssl dgst -sha256 -r "$1" | cut -d' ' -f1
+    openssl dgst -sha256 -r "$1" | cut -d' ' -f1 | sed 's/^\\//'
   fi
 }
 
@@ -117,11 +119,6 @@ cat >"$MIRROR/manifest.json" <<EOF
   }
 ]
 EOF
-
-# TEMP-DEBUG: diagnose Windows parse failure
-ls -l "$MIRROR"
-od -c "$MIRROR/manifest.json" | head -12
-od -c "$MIRROR/SHA256SUMS.txt" | head -6
 
 say "setup: stitch lean package"
 echo "FAKE TFS IMAGE PAYLOAD" >"$WORK/app.tfs"
