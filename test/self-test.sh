@@ -84,6 +84,12 @@ sha256_of() {
 }
 
 WORK=$(mktemp -d)
+if [ -n "$EXE" ]; then
+  # Native exes receive $WORK-derived paths verbatim (arg conversion is
+  # disabled above), so give them Windows-form paths. MSYS shell tools
+  # (mkdir/cp/dd/stat/rm) accept backslash paths fine.
+  WORK=$(cygpath -w "$WORK")
+fi
 trap 'rm -rf "$WORK"' EXIT
 
 TEBAKO_VER=9.9.9
