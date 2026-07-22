@@ -261,6 +261,59 @@ static char* narrow(const wchar_t* ws)
   }
   return s;
 }
+/* MSVCRT's spawn/exec does NOT quote arguments when building the child's
+ * command line, so an argument containing spaces would arrive split.
+ * Quote per CommandLineToArgvW rules (backslashes literal except before a
+ * quote; escaped quotes; trailing backslashes doubled before the closing
+ * quote). Arguments needing no quoting are copied verbatim. */
+static wchar_t* quote_arg_wide(const wchar_t* arg)
+{
+  size_t len = wcslen(arg);
+  wchar_t* out;
+  wchar_t* o;
+  size_t i;
+  size_t bs;
+  if (len > 0 && wcspbrk(arg, L" \t\"") == NULL) {
+    out = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+    if (out) {
+      wcscpy(out, arg);
+    }
+    return out;
+  }
+  out = (wchar_t*)malloc((2 * len + 4) * sizeof(wchar_t));
+  if (!out) {
+    return NULL;
+  }
+  o = out;
+  *o++ = L'"';
+  bs = 0;
+  for (i = 0; i < len; i++) {
+    if (arg[i] == L'\\') {
+      bs++;
+    } else if (arg[i] == L'"') {
+      while (bs--) {
+        *o++ = L'\\';
+        *o++ = L'\\';
+      }
+      *o++ = L'\\';
+      *o++ = L'"';
+      bs = 0;
+    } else {
+      while (bs--) {
+        *o++ = L'\\';
+      }
+      *o++ = arg[i];
+      bs = 0;
+    }
+  }
+  while (bs--) {
+    *o++ = L'\\';
+    *o++ = L'\\';
+  }
+  *o++ = L'"';
+  *o = L'\0';
+  return out;
+}
 #endif /* _WIN32 */
 
 static int self_path(char* buf, size_t cap)
@@ -1361,7 +1414,9 @@ static int exec_runtime(const char* runtime, const char* self, const tpkg_manife
       return fail(EX_TEBAKO_IO, "out of memory building runtime argv");
     }
     for (j = 0; j < i; j++) {
-      wargv[j] = widen(nargv[j]);
+      wchar_t* w = widen(nargv[j]);
+      wargv[j] = w ? quote_arg_wide(w) : NULL;
+      free(w);
     }
     rc = _wexecv(wruntime, (const wchar_t* const*)wargv);
     /* only reached on failure */
