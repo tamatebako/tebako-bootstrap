@@ -1,0 +1,200 @@
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of the Tebako project (tebako-bootstrap).
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+# THE POSSIBILITY OF SUCH DAMAGE.
+
+name: Release
+
+# Publishes tebako-bootstrap-<version>-<platform>[.exe] for every supported
+# platform, plus SHA256SUMS and manifest.json. tebako press (lean mode)
+# resolves these assets into the shared ~/.tebako/bootstraps cache.
+#
+# Linux binaries are fully static (TEBAKO_BOOTSTRAP_STATIC=ON): the launcher
+# only uses getenv + the curl CLI, no NSS, so a static binary runs on any
+# Linux of that architecture regardless of libc vintage. gnu legs build in
+# the tebako ubuntu-20.04 container as an additional baseline safeguard.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build the release from (e.g. v0.1.0)'
+        required: true
+
+concurrency:
+  # Never cancel a release mid-publish
+  group: 'release-${{ inputs.tag || github.ref_name }}'
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-gnu-x86_64
+            os: ubuntu-latest
+            container: ghcr.io/tamatebako/tebako-ubuntu-20.04-dev:latest
+            static: 'ON'
+          - platform: linux-gnu-arm64
+            os: ubuntu-24.04-arm
+            container: ghcr.io/tamatebako/tebako-ubuntu-20.04-dev:latest
+            static: 'ON'
+          - platform: linux-musl-x86_64
+            os: ubuntu-latest
+            container: alpine:3.21
+            static: 'ON'
+          - platform: macos-arm64
+            os: macos-14
+          - platform: macos-x86_64
+            os: macos-15-intel
+          - platform: windows-x86_64
+            os: windows-latest
+
+    steps:
+      - name: Bootstrap container (musl)
+        # nodejs + gcompat/libc6-compat run the runner's Node actions on
+        # musl; build-base/cmake/ninja are the toolchain.
+        if: matrix.platform == 'linux-musl-x86_64'
+        run: |
+          apk --no-cache --upgrade add \
+            bash git curl ca-certificates tar gzip \
+            nodejs gcompat libc6-compat \
+            build-base cmake ninja
+
+      - name: Declare directory safe (container)
+        if: startswith(matrix.platform, 'linux-')
+        run: git config --global --add safe.directory "$(pwd)"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag and version
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_ENV"
+          echo "version=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "${{ matrix.static }}" = "ON" ]; then
+            EXTRA="-DTEBAKO_BOOTSTRAP_STATIC=ON"
+          fi
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON $EXTRA
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release
+
+      - name: Self-test
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify static linkage (Linux)
+        if: matrix.static == 'ON'
+        shell: bash
+        run: |
+          BIN=$(find build -name tebako-bootstrap -type f | head -1)
+          file "$BIN"
+          if file "$BIN" | grep -q "dynamically linked"; then
+            echo "ERROR: $BIN is dynamically linked; static build expected" >&2
+            exit 1
+          fi
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p stage
+          BIN=$(find build -name 'tebako-bootstrap*' -type f \( -perm +111 -o -name '*.exe' \) | grep -v tpkg | head -1)
+          SUFFIX=""
+          case "${{ matrix.platform }}" in windows-*) SUFFIX=".exe" ;; esac
+          cp "$BIN" "stage/tebako-bootstrap-${{ env.version }}-${{ matrix.platform }}${SUFFIX}"
+
+      - name: Upload asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tebako-bootstrap-${{ matrix.platform }}
+          path: stage/
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and manifest
+        shell: bash
+        run: |
+          cd dist
+          sha256sum tebako-bootstrap-* > SHA256SUMS
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          {
+            echo "{"
+            echo "  \"name\": \"tebako-bootstrap\","
+            echo "  \"version\": \"$VERSION\","
+            echo "  \"assets\": ["
+            first=1
+            for f in tebako-bootstrap-*; do
+              [ "$first" = 1 ] || echo ","
+              first=0
+              platform="${f#tebako-bootstrap-$VERSION-}"
+              platform="${platform%.exe}"
+              sha=$(grep "  $f\$" SHA256SUMS | cut -d' ' -f1)
+              printf '    { "platform": "%s", "file": "%s", "sha256": "%s" }' "$platform" "$f" "$sha"
+            done
+            echo
+            echo "  ]"
+            echo "}"
+          } > manifest.json
+          cat manifest.json
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "tebako-bootstrap ${TAG#v}" \
+              --notes "Prebuilt tebako bootstrap launchers. Static on Linux; self-tested on all platforms before publish."
+          fi
