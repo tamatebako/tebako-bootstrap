@@ -1118,6 +1118,8 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
   char actual[65];
   char* text;
   int have_expected = 0;
+  int diag_manifest = 0; /* 0=not tried 1=fetch failed 2=read failed 3=no entry 4=ok */
+  int diag_sums = 0;
 
   if (xsnprintf(entry, sizeof(entry), "%s-%s-%s-%s", type, ver, abi, platform) != 0 ||
       xsnprintf(asset, sizeof(asset), "tebako-runtime-%s-%s-%s%s", abi, ver, platform, exe_suffix()) != 0) {
@@ -1221,24 +1223,43 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
   }
 
   /* expected checksum: manifest.json primary, SHA256SUMS.txt fallback */
+  diag_manifest = 1;
   if (xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/manifest.json", tmp_dir) == 0 &&
-      fetch_url(manifest_url, local, tmp_aux) == 0 && (text = read_text(tmp_aux)) != NULL) {
-    have_expected = sha_from_manifest_json(text, asset, expected) == 0;
-    free(text);
+      fetch_url(manifest_url, local, tmp_aux) == 0) {
+    diag_manifest = 2;
+    if ((text = read_text(tmp_aux)) != NULL) {
+      diag_manifest = 3;
+      have_expected = sha_from_manifest_json(text, asset, expected) == 0;
+      if (have_expected) {
+        diag_manifest = 4;
+      }
+      free(text);
+    }
   }
+  diag_sums = have_expected ? 0 : 1;
   if (!have_expected && xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/SHA256SUMS.txt", tmp_dir) == 0 &&
-      fetch_url(sums_url, local, tmp_aux) == 0 && (text = read_text(tmp_aux)) != NULL) {
-    have_expected = sha_from_sums(text, asset, expected) == 0;
-    free(text);
+      fetch_url(sums_url, local, tmp_aux) == 0) {
+    diag_sums = 2;
+    if ((text = read_text(tmp_aux)) != NULL) {
+      diag_sums = 3;
+      have_expected = sha_from_sums(text, asset, expected) == 0;
+      if (have_expected) {
+        diag_sums = 4;
+      }
+      free(text);
+    }
   }
   if (!have_expected) {
+    static const char* const diag_names[] = {"not tried", "download failed", "read failed",
+                                             "no matching entry", "ok"};
     cleanup_tmp_entry(tmp_dir, asset);
     lock_release(&lk);
     return fail(EX_TEBAKO_UNAVAILABLE,
                 "cannot resolve runtime \"%s\": no checksum for %s in the release\n"
-                "  tried: %s\n"
-                "         %s",
-                runtime_ref, asset, manifest_url, sums_url);
+                "  tried: %s (%s)\n"
+                "         %s (%s)",
+                runtime_ref, asset, manifest_url, diag_names[diag_manifest], sums_url,
+                diag_names[diag_sums]);
   }
 
   if (sha256_file_hex(tmp_asset, actual) != 0) {
