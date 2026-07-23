@@ -50,7 +50,7 @@
  *        8     8    u64 size   (image length in bytes)
  *       16     4    u32 format_id (0=auto(magic), 1=dwarfs, 2=squashfs, 3=zip, 4=runtime payload)
  *       20     4    u32 flags
- *       24   256    char mount_point[256] (UTF-8, NUL-padded; empty for runtime payloads)
+ *       24   256    char mount_point[256] (UTF-8, NUL-padded)
  *
  * Reader algorithm: read the fixed-size header at EOF - TPKG_HEADER_SIZE,
  * check the magic, verify header_crc32, then read slot_count slot records at
@@ -108,8 +108,8 @@ extern "C" {
 #define TPKG_FORMAT_DWARFS 1u
 #define TPKG_FORMAT_SQUASHFS 2u
 #define TPKG_FORMAT_ZIP 3u
-/* runtime payload slot of a fat package: the bootstrap installs it into the
- * shared cache at first run; it is never mounted as a filesystem image */
+/* A runtime payload slot (fat packages): the compressed language-runtime
+ * package the bootstrap installs into the shared cache on first run. */
 #define TPKG_FORMAT_RUNTIME 4u
 
 /* ---- error codes (returned by tpkg_errno) -------------------------------- */
