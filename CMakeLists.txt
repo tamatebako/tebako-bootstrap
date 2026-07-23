@@ -24,7 +24,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 cmake_minimum_required(VERSION 3.16)
-project(tebako-bootstrap VERSION 0.1.0 LANGUAGES C)
+project(tebako-bootstrap VERSION 0.2.0 LANGUAGES C)
 
 # The launcher downloads and execs other binaries: keep it small, auditable,
 # and free of dependencies beyond the C runtime library (C99).

@@ -32,6 +32,10 @@
  * What this is (see README.md for the full contract):
  *
  *   A lean tebako package = [tebako-bootstrap][.tfs image slots][tpkg trailer].
+ *   A fat tebako package = lean + the runtime package itself as a payload
+ *   slot (format_id=TPKG_FORMAT_RUNTIME); at first run the payload is
+ *   installed into the cache (SHA256-verified against the ;sha256= parameter
+ *   of runtime_ref) instead of being downloaded — no network needed.
  *   This launcher, when executed as such a package:
  *     1. finds its own executable path;
  *     2. parses the tpkg manifest trailer at EOF (vendored tebako/tpkg.h);
@@ -101,7 +105,7 @@ typedef ssize_t tbs_ssize_t;
 
 /* ---- constants ------------------------------------------------------------ */
 
-#define TEBAKO_BOOTSTRAP_VERSION "0.1.0"
+#define TEBAKO_BOOTSTRAP_VERSION "0.2.0"
 #define TEBAKO_BOOTSTRAP_LAUNCHER_ABI 1u
 
 /* Exit codes (documented in README.md). */
@@ -1041,6 +1045,28 @@ static int offline_mode(void)
   return v && *v && strcmp(v, "0") != 0;
 }
 
+/* Extract the trailing ";sha256=<64hex>" parameter of a runtime_ref (the fat
+ * package's payload checksum, written by the gem's fat press). Returns 0 and
+ * fills hex on success, -1 when absent or malformed. */
+static int runtime_ref_sha256(const char* ref, char hex[65])
+{
+  const char* p = strstr(ref, ";sha256=");
+  size_t i;
+  if (!p) {
+    return -1;
+  }
+  p += 8;
+  for (i = 0; i < 64; i++) {
+    char ch = p[i];
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+      return -1;
+    }
+    hex[i] = ch;
+  }
+  hex[64] = '\0';
+  return p[64] == '\0' || p[64] == ';' ? 0 : -1;
+}
+
 static int cache_root(char* buf, size_t cap)
 {
   const char* home = getenv("TEBAKO_HOME");
@@ -1142,12 +1168,269 @@ static int write_small_file(const char* path, const char* content)
 }
 
 /*
+ * Staging context of a cache install: the held entry lock and the tmp staging
+ * paths filled by begin_entry_install, completed by publish_entry.
+ */
+typedef struct {
+  entry_lock lk;
+  char tmp_dir[PATH_BUF];
+  char tmp_asset[PATH_BUF];
+} entry_install;
+
+/*
+ * Serialize the install of a cache entry and stage its tmp dir
+ * (<root>/tmp/<entry>.<pid>, swept of leftovers). Returns 0 with the entry
+ * lock held, 1 when the entry appeared in the cache meanwhile (nothing held —
+ * the caller just uses exe_path), or an exit code after printing an error
+ * (nothing held).
+ */
+static int begin_entry_install(const char* root, const char* entry, const char* exe_path,
+                               const char* asset, const char* runtime_ref, entry_install* ins)
+{
+  char lock_path[PATH_BUF];
+  char d[PATH_BUF];
+
+  if (xsnprintf(lock_path, sizeof(lock_path), "%s/locks/%s.lock", root, entry) != 0) {
+    return fail(EX_TEBAKO_IO, "cache path too long under %s", root);
+  }
+  if (xsnprintf(d, sizeof(d), "%s/locks", root) != 0 || mkdir_p(d) != 0 ||
+      xsnprintf(d, sizeof(d), "%s/tmp", root) != 0 || mkdir_p(d) != 0 ||
+      xsnprintf(d, sizeof(d), "%s/runtimes", root) != 0 || mkdir_p(d) != 0) {
+    return fail(EX_TEBAKO_IO, "cannot create tebako cache directories under %s: %s", root, strerror(errno));
+  }
+
+  /* serialize concurrent first runs of any tebako app needing this runtime */
+  if (lock_acquire(&ins->lk, lock_path) != 0) {
+    if (errno == ETIMEDOUT) {
+      return fail(EX_TEBAKO_UNAVAILABLE,
+                  "timed out after %us waiting for another tebako bootstrap to finish installing \"%s\"\n"
+                  "  lock: %s\n"
+                  "  if no other tebako process is running, remove the stale lock file",
+                  LOCK_TIMEOUT_MS / 1000u, runtime_ref, lock_path);
+    }
+    return fail(EX_TEBAKO_IO, "cannot acquire install lock %s: %s", lock_path, strerror(errno));
+  }
+
+  /* re-check under the lock: another process may have installed it */
+  if (file_exists(exe_path)) {
+    lock_release(&ins->lk);
+    return 1;
+  }
+
+  if (xsnprintf(ins->tmp_dir, sizeof(ins->tmp_dir), "%s/tmp/%s.%ld", root, entry, (long)
+#if defined(_WIN32)
+                _getpid()
+#else
+                getpid()
+#endif
+                    ) != 0 ||
+      xsnprintf(ins->tmp_asset, sizeof(ins->tmp_asset), "%s/%s", ins->tmp_dir, asset) != 0) {
+    lock_release(&ins->lk);
+    return fail(EX_TEBAKO_IO, "cache path too long under %s", root);
+  }
+  cleanup_tmp_entry(ins->tmp_dir, asset); /* sweep leftovers from a crashed run */
+  if (os_mkdir(ins->tmp_dir) != 0) {
+    lock_release(&ins->lk);
+    return fail(EX_TEBAKO_IO, "cannot create %s: %s", ins->tmp_dir, strerror(errno));
+  }
+  return 0;
+}
+
+/*
+ * Complete a staged install started by begin_entry_install: executable bit,
+ * sha256/origin metadata, atomic rename into the cache, lock release. The
+ * origin text is free-form provenance ("runtime_ref=...\nurl|payload=...\n").
+ * Returns 0 and fills out_path on success; on failure returns the exit code
+ * after printing an error (staging dir swept, lock released).
+ */
+static int publish_entry(entry_install* ins, const char* entry_dir, const char* exe_path,
+                         const char* asset, const char* sha_hex, const char* origin,
+                         char* out_path, size_t out_cap)
+{
+  char tmp_aux[PATH_BUF];
+  int rc = 0;
+
+  make_executable(ins->tmp_asset);
+  if (xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/sha256", ins->tmp_dir) == 0) {
+    char content[160];
+    xsnprintf(content, sizeof(content), "%s  %s\n", sha_hex, asset);
+    write_small_file(tmp_aux, content);
+  }
+  if (xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/origin", ins->tmp_dir) == 0) {
+    write_small_file(tmp_aux, origin);
+  }
+
+  if (file_exists(entry_dir)) {
+    /* directory exists without the executable — an interrupted manual edit;
+     * never delete user state behind its back */
+    rc = fail(EX_TEBAKO_IO,
+              "cache entry %s exists but is incomplete (missing %s)\n"
+              "  remove that directory and run again",
+              entry_dir, asset);
+  } else if (os_rename(ins->tmp_dir, entry_dir) != 0) {
+    rc = fail(EX_TEBAKO_IO, "cannot install runtime into the cache (%s -> %s): %s", ins->tmp_dir, entry_dir,
+              strerror(errno));
+  }
+  if (rc != 0) {
+    cleanup_tmp_entry(ins->tmp_dir, asset);
+    lock_release(&ins->lk);
+    return rc;
+  }
+  lock_release(&ins->lk);
+
+  if (xsnprintf(out_path, out_cap, "%s", exe_path) != 0) {
+    return fail(EX_TEBAKO_IO, "cache path too long");
+  }
+  return 0;
+}
+
+#if defined(_WIN32)
+#define tbs_lseek _lseeki64
+#else
+#define tbs_lseek lseek
+#endif
+
+/*
+ * Copy <size> bytes at <offset> of self_fd into dst (created/truncated).
+ * Returns 0 on success, -1 on i/o error, -2 when the region lies outside the
+ * file (corrupt slot geometry).
+ */
+static int extract_payload(int self_fd, uint64_t offset, uint64_t size, const char* dst)
+{
+  int64_t fsize = (int64_t)tbs_lseek(self_fd, 0, SEEK_END);
+  char buf[65536];
+  uint64_t left = size;
+  int out;
+
+  if (fsize < 0) {
+    return -1;
+  }
+  if (offset > (uint64_t)fsize || size > (uint64_t)fsize - offset) {
+    return -2;
+  }
+  if (tbs_lseek(self_fd, (int64_t)offset, SEEK_SET) < 0) {
+    return -1;
+  }
+  out = os_open_write(dst);
+  if (out < 0) {
+    return -1;
+  }
+  while (left > 0) {
+    size_t chunk = left < (uint64_t)sizeof(buf) ? (size_t)left : sizeof(buf);
+    tbs_ssize_t r = tbs_read(self_fd, buf, chunk);
+    if (r <= 0) {
+      tbs_close(out);
+      os_remove(dst);
+      return -1;
+    }
+    {
+      char* p = buf;
+      tbs_ssize_t todo = r;
+      while (todo > 0) {
+#if defined(_WIN32)
+        tbs_ssize_t w = (tbs_ssize_t)_write(out, p, (unsigned int)todo);
+#else
+        tbs_ssize_t w = (tbs_ssize_t)write(out, p, (size_t)todo);
+#endif
+        if (w <= 0) {
+          tbs_close(out);
+          os_remove(dst);
+          return -1;
+        }
+        p += w;
+        todo -= w;
+      }
+    }
+    left -= (uint64_t)r;
+  }
+  if (tbs_close(out) != 0) {
+    os_remove(dst);
+    return -1;
+  }
+  return 0;
+}
+
+/*
+ * Fat package path: the runtime is embedded as a payload slot of the package
+ * itself (format_id TPKG_FORMAT_RUNTIME). Extract it from the own executable
+ * and install it into the cache, SHA256-verified against the ;sha256=
+ * parameter of runtime_ref — no network access needed. Returns 0 and fills
+ * out_path on success; on failure returns the exit code after printing.
+ */
+static int install_payload(const char* runtime_ref, const char* self, const tpkg_slot* slot,
+                           const char* root, const char* entry, const char* entry_dir,
+                           const char* exe_path, const char* asset, char* out_path, size_t out_cap)
+{
+  entry_install ins;
+  char expected[65];
+  char actual[65];
+  char origin[PATH_BUF + 256];
+  int self_fd;
+  int rc;
+
+  if (runtime_ref_sha256(runtime_ref, expected) != 0) {
+    return fail(EX_TEBAKO_RUNTIME_REF,
+                "fat package carries no usable payload checksum — runtime_ref \"%s\"\n"
+                "  expected \"<type>@<version>;tebako=<abi>;sha256=<64 lowercase hex>\"",
+                runtime_ref);
+  }
+
+  rc = begin_entry_install(root, entry, exe_path, asset, runtime_ref, &ins);
+  if (rc == 1) {
+    return xsnprintf(out_path, out_cap, "%s", exe_path) == 0 ? 0
+                                                             : fail(EX_TEBAKO_IO, "cache path too long");
+  }
+  if (rc != 0) {
+    return rc;
+  }
+
+  self_fd = os_open_read(self);
+  if (self_fd < 0) {
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
+    return fail(EX_TEBAKO_IO, "cannot open own executable %s: %s", self, strerror(errno));
+  }
+  rc = extract_payload(self_fd, slot->offset, slot->size, ins.tmp_asset);
+  tbs_close(self_fd);
+  if (rc != 0) {
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
+    if (rc == -2) {
+      return fail(EX_TEBAKO_MANIFEST,
+                  "corrupt tebako manifest trailer in %s (runtime payload slot outside file bounds) — "
+                  "re-stitch the package",
+                  self);
+    }
+    return fail(EX_TEBAKO_IO, "cannot extract the runtime payload from %s: %s", self, strerror(errno));
+  }
+
+  if (sha256_file_hex(ins.tmp_asset, actual) != 0) {
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
+    return fail(EX_TEBAKO_IO, "cannot hash extracted payload: %s", strerror(errno));
+  }
+  if (strcmp(expected, actual) != 0) {
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
+    return fail(EX_TEBAKO_SHA,
+                "SHA256 mismatch for the runtime payload of %s — refusing to install or execute\n"
+                "  expected: %s (from the package's runtime_ref)\n"
+                "  actual:   %s\n"
+                "  the cache was not touched",
+                self, expected, actual);
+  }
+
+  xsnprintf(origin, sizeof(origin), "runtime_ref=%s\npayload=%s\nsha256=%s\n", runtime_ref, self, actual);
+  return publish_entry(&ins, entry_dir, exe_path, asset, actual, origin, out_path, out_cap);
+}
+
+/*
  * Resolve the runtime named by runtime_ref to a local executable path.
  * Returns 0 and fills out_path on success; on failure returns the exit code
  * after printing a spec-conformant error.
  */
 static int resolve_runtime(const char* runtime_ref, const char* type, const char* ver, const char* abi,
-                           char* out_path, size_t out_cap)
+                           const char* self, const tpkg_manifest* m, char* out_path, size_t out_cap)
 {
   const char* platform = platform_string();
   char entry[512];
@@ -1155,9 +1438,6 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
   char root[PATH_BUF];
   char entry_dir[PATH_BUF];
   char exe_path[PATH_BUF];
-  char lock_path[PATH_BUF];
-  char tmp_dir[PATH_BUF];
-  char tmp_asset[PATH_BUF];
   char tmp_aux[PATH_BUF];
   char base_buf[URL_BUF];
   const char* base_raw = releases_base();
@@ -1166,13 +1446,16 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
   char asset_url[URL_BUF];
   char manifest_url[URL_BUF];
   char sums_url[URL_BUF];
-  entry_lock lk;
+  entry_install ins;
+  uint32_t payload_slot;
   char expected[65];
   char actual[65];
+  char origin[URL_BUF + 256];
   char* text;
   int have_expected = 0;
   int diag_manifest = 0; /* 0=not tried 1=fetch failed 2=read failed 3=no entry 4=ok */
   int diag_sums = 0;
+  int rc;
 
   if (xsnprintf(entry, sizeof(entry), "%s-%s-%s-%s", type, ver, abi, platform) != 0 ||
       xsnprintf(asset, sizeof(asset), "tebako-runtime-%s-%s-%s%s", abi, ver, platform, exe_suffix()) != 0) {
@@ -1194,6 +1477,15 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
     return 0;
   }
 
+  /* fat package: the runtime rides along as a payload slot — install it
+   * instead of downloading (works with TEBAKO_OFFLINE=1) */
+  for (payload_slot = 0; payload_slot < m->slot_count; payload_slot++) {
+    if (m->slots[payload_slot].format_id == TPKG_FORMAT_RUNTIME) {
+      return install_payload(runtime_ref, self, &m->slots[payload_slot], root, entry, entry_dir, exe_path,
+                             asset, out_path, out_cap);
+    }
+  }
+
   /* URLs (built up front so failures can name what was tried) */
   base = skip_file_scheme(base_raw);
   local = base_is_local(base_raw);
@@ -1213,60 +1505,20 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
                 runtime_ref, entry_dir, asset_url);
   }
 
-  if (xsnprintf(lock_path, sizeof(lock_path), "%s/locks/%s.lock", root, entry) != 0) {
-    return fail(EX_TEBAKO_IO, "cache path too long under %s", root);
-  }
-  {
-    char d[PATH_BUF];
-    if (xsnprintf(d, sizeof(d), "%s/locks", root) != 0 || mkdir_p(d) != 0 ||
-        xsnprintf(d, sizeof(d), "%s/tmp", root) != 0 || mkdir_p(d) != 0 ||
-        xsnprintf(d, sizeof(d), "%s/runtimes", root) != 0 || mkdir_p(d) != 0) {
-      return fail(EX_TEBAKO_IO, "cannot create tebako cache directories under %s: %s", root, strerror(errno));
-    }
-  }
-
-  /* serialize concurrent first runs of any tebako app needing this runtime */
-  if (lock_acquire(&lk, lock_path) != 0) {
-    if (errno == ETIMEDOUT) {
-      return fail(EX_TEBAKO_UNAVAILABLE,
-                  "timed out after %us waiting for another tebako bootstrap to finish installing \"%s\"\n"
-                  "  lock: %s\n"
-                  "  if no other tebako process is running, remove the stale lock file",
-                  LOCK_TIMEOUT_MS / 1000u, runtime_ref, lock_path);
-    }
-    return fail(EX_TEBAKO_IO, "cannot acquire install lock %s: %s", lock_path, strerror(errno));
-  }
-
-  /* re-check under the lock: another process may have installed it */
-  if (file_exists(exe_path)) {
-    lock_release(&lk);
+  rc = begin_entry_install(root, entry, exe_path, asset, runtime_ref, &ins);
+  if (rc == 1) {
     if (xsnprintf(out_path, out_cap, "%s", exe_path) != 0) {
       return fail(EX_TEBAKO_IO, "cache path too long under %s", root);
     }
     return 0;
   }
-
-  /* build the entry in tmp/ on the same filesystem, then rename atomically */
-  if (xsnprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp/%s.%ld", root, entry, (long)
-#if defined(_WIN32)
-                _getpid()
-#else
-                getpid()
-#endif
-                    ) != 0 ||
-      xsnprintf(tmp_asset, sizeof(tmp_asset), "%s/%s", tmp_dir, asset) != 0) {
-    lock_release(&lk);
-    return fail(EX_TEBAKO_IO, "cache path too long under %s", root);
-  }
-  cleanup_tmp_entry(tmp_dir, asset); /* sweep leftovers from a crashed run */
-  if (os_mkdir(tmp_dir) != 0) {
-    lock_release(&lk);
-    return fail(EX_TEBAKO_IO, "cannot create %s: %s", tmp_dir, strerror(errno));
+  if (rc != 0) {
+    return rc;
   }
 
-  if (fetch_url(asset_url, local, tmp_asset) != 0) {
-    cleanup_tmp_entry(tmp_dir, asset);
-    lock_release(&lk);
+  if (fetch_url(asset_url, local, ins.tmp_asset) != 0) {
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
     return fail(EX_TEBAKO_UNAVAILABLE,
                 "cannot resolve runtime \"%s\": download failed\n"
                 "  url: %s\n"
@@ -1277,7 +1529,7 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
 
   /* expected checksum: manifest.json primary, SHA256SUMS.txt fallback */
   diag_manifest = 1;
-  if (xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/manifest.json", tmp_dir) == 0 &&
+  if (xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/manifest.json", ins.tmp_dir) == 0 &&
       fetch_url(manifest_url, local, tmp_aux) == 0) {
     diag_manifest = 2;
     if ((text = read_text(tmp_aux)) != NULL) {
@@ -1290,7 +1542,7 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
     }
   }
   diag_sums = have_expected ? 0 : 1;
-  if (!have_expected && xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/SHA256SUMS.txt", tmp_dir) == 0 &&
+  if (!have_expected && xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/SHA256SUMS.txt", ins.tmp_dir) == 0 &&
       fetch_url(sums_url, local, tmp_aux) == 0) {
     diag_sums = 2;
     if ((text = read_text(tmp_aux)) != NULL) {
@@ -1305,8 +1557,8 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
   if (!have_expected) {
     static const char* const diag_names[] = {"not tried", "download failed", "read failed",
                                              "no matching entry", "ok"};
-    cleanup_tmp_entry(tmp_dir, asset);
-    lock_release(&lk);
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
     return fail(EX_TEBAKO_UNAVAILABLE,
                 "cannot resolve runtime \"%s\": no checksum for %s in the release\n"
                 "  tried: %s (%s)\n"
@@ -1315,15 +1567,15 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
                 diag_names[diag_sums]);
   }
 
-  if (sha256_file_hex(tmp_asset, actual) != 0) {
-    cleanup_tmp_entry(tmp_dir, asset);
-    lock_release(&lk);
-    return fail(EX_TEBAKO_IO, "cannot hash downloaded file %s: %s", tmp_asset, strerror(errno));
+  if (sha256_file_hex(ins.tmp_asset, actual) != 0) {
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
+    return fail(EX_TEBAKO_IO, "cannot hash downloaded file %s: %s", ins.tmp_asset, strerror(errno));
   }
   lower_hex(expected);
   if (strcmp(expected, actual) != 0) {
-    cleanup_tmp_entry(tmp_dir, asset);
-    lock_release(&lk);
+    cleanup_tmp_entry(ins.tmp_dir, asset);
+    lock_release(&ins.lk);
     return fail(EX_TEBAKO_SHA,
                 "SHA256 mismatch for downloaded runtime %s — refusing to install or execute\n"
                 "  expected: %s (from %s)\n"
@@ -1332,40 +1584,8 @@ static int resolve_runtime(const char* runtime_ref, const char* type, const char
                 asset, expected, manifest_url, actual);
   }
 
-  /* complete the entry, then publish atomically */
-  make_executable(tmp_asset);
-  if (xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/sha256", tmp_dir) == 0) {
-    char content[160];
-    xsnprintf(content, sizeof(content), "%s  %s\n", actual, asset);
-    write_small_file(tmp_aux, content);
-  }
-  if (xsnprintf(tmp_aux, sizeof(tmp_aux), "%s/origin", tmp_dir) == 0) {
-    char content[URL_BUF + 256];
-    xsnprintf(content, sizeof(content), "runtime_ref=%s\nurl=%s\nsha256=%s\n", runtime_ref, asset_url, actual);
-    write_small_file(tmp_aux, content);
-  }
-  if (file_exists(entry_dir)) {
-    /* directory exists without the executable — an interrupted manual edit;
-     * never delete user state behind its back */
-    cleanup_tmp_entry(tmp_dir, asset);
-    lock_release(&lk);
-    return fail(EX_TEBAKO_IO,
-                "cache entry %s exists but is incomplete (missing %s)\n"
-                "  remove that directory and run again",
-                entry_dir, asset);
-  }
-  if (os_rename(tmp_dir, entry_dir) != 0) {
-    cleanup_tmp_entry(tmp_dir, asset);
-    lock_release(&lk);
-    return fail(EX_TEBAKO_IO, "cannot install runtime into the cache (%s -> %s): %s", tmp_dir, entry_dir,
-                strerror(errno));
-  }
-  lock_release(&lk);
-
-  if (xsnprintf(out_path, out_cap, "%s", exe_path) != 0) {
-    return fail(EX_TEBAKO_IO, "cache path too long under %s", root);
-  }
-  return 0;
+  xsnprintf(origin, sizeof(origin), "runtime_ref=%s\nurl=%s\nsha256=%s\n", runtime_ref, asset_url, actual);
+  return publish_entry(&ins, entry_dir, exe_path, asset, actual, origin, out_path, out_cap);
 }
 
 /* ---- exec handoff (launcher ABI v1) ------------------------------------------ */
@@ -1386,6 +1606,9 @@ static int exec_runtime(const char* runtime, const char* self, const tpkg_manife
   }
   nargv[i++] = (char*)runtime;
   for (s = 0; s < m->slot_count; s++) {
+    if (m->slots[s].format_id == TPKG_FORMAT_RUNTIME) {
+      continue; /* runtime payload: installed into the cache, never mounted */
+    }
     if (xsnprintf(image_arg[s], sizeof(image_arg[s]), "%s:%u:%s", self, (unsigned)s,
                   m->slots[s].mount_point) != 0) {
       free(nargv);
@@ -1486,7 +1709,7 @@ int main(int argc, char** argv)
                 "cannot parse runtime_ref \"%s\" — expected \"<type>@<version>;tebako=<abi>\"", m.runtime_ref);
   }
 
-  rc = resolve_runtime(m.runtime_ref, type, ver, abi, runtime, sizeof(runtime));
+  rc = resolve_runtime(m.runtime_ref, type, ver, abi, self, &m, runtime, sizeof(runtime));
   if (rc != 0) {
     return rc;
   }

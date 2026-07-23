@@ -126,6 +126,10 @@ PKG=$WORK/myapp$EXE
 "$STITCH" --base "$BOOTSTRAP" --image "$WORK/app.tfs:/__tebako_memfs__" \
   --runtime-ref "$REF" -o "$PKG"
 chmod +x "$PKG"
+# the image bytes must actually be appended (base + image + 1 slot + header)
+size_of() { wc -c <"$1" | tr -d ' '; }
+EXPECTED=$(( $(size_of "$BOOTSTRAP") + $(size_of "$WORK/app.tfs") + 280 + 166 ))
+[ "$(size_of "$PKG")" -eq "$EXPECTED" ] || fail "lean package size mismatch (image bytes missing?)"
 
 run_pkg() {
   env TEBAKO_HOME="$WORK/home" TEBAKO_RUNTIME_MIRROR="$MIRRORROOT" "$PKG" hello "arg two"
@@ -209,5 +213,44 @@ RC=$?
 set -e
 echo "$OUT"
 [ "$RC" -eq 65 ] || fail "corrupt trailer: want exit 65, got $RC"
+
+say "setup: fat packages (runtime payload slot)"
+FATPKG=$WORK/fatapp$EXE
+"$STITCH" --base "$BOOTSTRAP" --image "$WORK/app.tfs:/__tebako_memfs__" \
+  --runtime-payload "$FAKE" --runtime-ref "$REF;sha256=$SHA" -o "$FATPKG"
+chmod +x "$FATPKG"
+# base + image + payload + 2 slots + header
+EXPECTED=$(( $(size_of "$BOOTSTRAP") + $(size_of "$WORK/app.tfs") + $(size_of "$FAKE") + 560 + 166 ))
+[ "$(size_of "$FATPKG")" -eq "$EXPECTED" ] || fail "fat package size mismatch (payload bytes missing?)"
+# same layout, but the payload bytes are tampered (sha256 no longer matches)
+cp "$FAKE" "$WORK/tampered-runtime$EXE"
+printf 'X' >>"$WORK/tampered-runtime$EXE"
+BADPKG=$WORK/badfat$EXE
+"$STITCH" --base "$BOOTSTRAP" --image "$WORK/app.tfs:/__tebako_memfs__" \
+  --runtime-payload "$WORK/tampered-runtime$EXE" --runtime-ref "$REF;sha256=$SHA" -o "$BADPKG"
+chmod +x "$BADPKG"
+
+say "8: fat package installs the payload offline"
+OUT=$(TEBAKO_OFFLINE=1 TEBAKO_HOME=$WORK/home-fat "$FATPKG" hello "arg two")
+echo "$OUT"
+echo "$OUT" | grep -q -e 'FAKE-RUNTIME' || fail "fat run failed"
+[ "$(echo "$OUT" | grep -c -- '--tebako-image')" -eq 1 ] || fail "payload slot leaked into --tebako-image argv"
+echo "$OUT" | grep -q -e ':0:/__tebako_memfs__' || fail "image slot missing from argv"
+[ -f "$WORK/home-fat/runtimes/$ENTRY/$ASSET" ] || fail "payload not installed into cache"
+[ -f "$WORK/home-fat/runtimes/$ENTRY/sha256" ] || fail "sha256 metadata missing"
+
+say "9: fat package with a tampered payload is refused"
+set +e
+OUT=$(TEBAKO_OFFLINE=1 TEBAKO_HOME=$WORK/home-bad "$BADPKG" 2>&1)
+RC=$?
+set -e
+echo "$OUT"
+[ "$RC" -eq 70 ] || fail "payload sha mismatch: want exit 70, got $RC"
+echo "$OUT" | grep -q -i -e 'payload' || fail "payload sha error does not mention the payload"
+[ ! -e "$WORK/home-bad/runtimes/$ENTRY" ] || fail "mismatched payload entered the cache"
+
+say "10: populated cache wins over the payload (never re-verified)"
+OUT=$(TEBAKO_OFFLINE=1 TEBAKO_HOME=$WORK/home-fat "$BADPKG" hello 2>&1)
+echo "$OUT" | grep -q -e 'FAKE-RUNTIME' || fail "fat cache-hit run failed"
 
 say "PASS: all self-test scenarios succeeded (platform $PLAT)"
