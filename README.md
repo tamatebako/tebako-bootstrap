@@ -28,9 +28,11 @@ parts:
 - **Lean** (three-part): bootstrap + images + manifest trailer
   (`TPKG_FLAG_LEAN` set, `runtime_ref` filled). First run resolves the runtime
   into the machine-wide shared cache; every run ends in `execve(runtime, …)`.
-- **Self-installing fat** (planned): lean package that also carries the runtime
-  as a payload slot; first run installs it into the shared cache. Not yet
-  implemented in the launcher.
+- **Self-installing fat** (three-part): a lean package that also carries the
+  runtime package itself as a payload slot (`format_id=TPKG_FORMAT_RUNTIME`,
+  never mounted). First run installs the payload into the shared cache —
+  SHA256-verified against the `;sha256=` parameter of `runtime_ref` — instead
+  of downloading it, so fat packages run with no network access at all.
 
 ## What the launcher does
 
@@ -44,10 +46,17 @@ parts:
 3. Checks `launcher_abi` in the trailer against the ABI this build supports
    (currently **1**); a newer package → clear error naming both ABIs.
 4. Parses `runtime_ref` — `"<type>@<version>;tebako=<abi>"`, e.g.
-   `ruby@3.3.7;tebako=0.15.0`.
-5. Resolves the runtime:
+   `ruby@3.3.7;tebako=0.15.0`. A fat package's `runtime_ref` additionally
+   carries `;sha256=<64 lowercase hex>` — the checksum of the embedded
+   runtime payload.
+5. Resolves the runtime, in order:
    - **Cache hit** (`$TEBAKO_HOME/runtimes/<type>-<version>-<tebakoabi>-<platform>/`,
      default `$TEBAKO_HOME` = `~/.tebako`, Windows `%LOCALAPPDATA%\tebako`) → exec.
+   - **Payload present** (fat package) → per-entry lock, re-check, extract the
+     payload slot from the own executable, verify it against the `;sha256=`
+     parameter of `runtime_ref`, and atomically install it into the cache —
+     no network access needed (honors `TEBAKO_OFFLINE=1`). A payload checksum
+     mismatch refuses execution; a populated cache is never re-verified.
    - **Miss** → per-entry lock (flock / `LockFileEx`, with timeout), re-check,
      then download from
      `https://github.com/tamatebako/tebako-runtime-ruby/releases/download/v<tebako>/tebako-runtime-<tebako>-<version>-<platform>[.exe]`,
@@ -62,8 +71,9 @@ parts:
              --tebako-entry <original-argv0> <user args…>
    ```
 
-   One `--tebako-image` per slot. The runtime mounts the images directly out
-   of the bootstrap's file — the bootstrap never mounts anything. Parsers
+   One `--tebako-image` per image slot (runtime payload slots are never
+   handed over). The runtime mounts the images directly out of the
+   bootstrap's file — the bootstrap never mounts anything. Parsers
    split the value at the **last two** colons (mount point, then slot index),
    so Windows drive letters in the path are unambiguous.
 
@@ -105,9 +115,9 @@ Native TLS fetch is on the roadmap.
 | `0` | (never returns — `exec`) |
 | `65` | manifest missing, corrupt, or structurally invalid |
 | `66` | launcher ABI mismatch (package requires newer bootstrap) |
-| `67` | `runtime_ref` missing or unparsable |
+| `67` | `runtime_ref` missing or unparsable (fat: payload checksum parameter missing) |
 | `69` | runtime unavailable: not cached and unreachable / offline / lock timeout |
-| `70` | SHA256 mismatch — download deleted, cache untouched |
+| `70` | SHA256 mismatch — downloaded or embedded payload deleted, cache untouched |
 | `74` | local I/O failure (cache not writable, exec failed, …) |
 
 ## Build
@@ -138,7 +148,9 @@ The self-test stitches a lean package out of the freshly built launcher, a
 fake runtime (a tiny program that prints its arguments) served from a local
 mirror directory, and a fake image slot — then verifies the download path, the
 cache-hit path, offline failure, SHA256-mismatch refusal, ABI mismatch, and
-the no-trailer error. See [`test/self-test.sh`](test/self-test.sh).
+the no-trailer error; plus, for fat packages (runtime payload slot): offline
+payload install, payload SHA256-mismatch refusal, and the populated-cache-wins
+order. See [`test/self-test.sh`](test/self-test.sh).
 
 ## Repo layout
 
