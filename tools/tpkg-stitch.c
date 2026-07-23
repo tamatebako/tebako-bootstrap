@@ -29,12 +29,14 @@
  * POSSIBILITY OF SUCH DAMAGE.
  *
  * Usage:
- *   tpkg-stitch --base FILE [--image FILE:MOUNT]... [--runtime-ref REF]
- *               [--launcher-abi N] [--lean] -o OUT
+ *   tpkg-stitch --base FILE [--image FILE:MOUNT]... [--runtime-payload FILE]
+ *               [--runtime-ref REF] [--launcher-abi N] [--lean] -o OUT
  *
  * Copies --base to OUT, appends each image payload (format_id=AUTO, mount
- * point taken after the LAST ':'), then writes the tpkg trailer. --lean sets
- * TPKG_FLAG_LEAN (default when --runtime-ref is given).
+ * point taken after the LAST ':'), optionally appends a runtime payload slot
+ * (format_id=RUNTIME, empty mount point — the fat-package layout), then writes
+ * the tpkg trailer. --lean sets TPKG_FLAG_LEAN (default when --runtime-ref is
+ * given).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -77,8 +79,8 @@ typedef ssize_t tbs_ssize_t;
 static void usage(FILE* f)
 {
   fprintf(f,
-          "usage: tpkg-stitch --base FILE [--image FILE:MOUNT]... [--runtime-ref REF]\n"
-          "                   [--launcher-abi N] [--lean] [--no-lean] -o OUT\n");
+          "usage: tpkg-stitch --base FILE [--image FILE:MOUNT]... [--runtime-payload FILE]\n"
+          "                   [--runtime-ref REF] [--launcher-abi N] [--lean] [--no-lean] -o OUT\n");
 }
 
 static int copy_fd_contents(int in, int out)
@@ -115,6 +117,7 @@ int main(int argc, char** argv)
   const char* base = NULL;
   const char* out = NULL;
   const char* runtime_ref = "";
+  const char* payload = NULL;
   unsigned long launcher_abi = 1;
   int lean = -1; /* -1 = auto: lean iff runtime_ref given */
   const char* images[TPKG_MAX_SLOTS];
@@ -132,6 +135,8 @@ int main(int argc, char** argv)
       out = argv[++i];
     } else if (strcmp(a, "--runtime-ref") == 0 && i + 1 < argc) {
       runtime_ref = argv[++i];
+    } else if (strcmp(a, "--runtime-payload") == 0 && i + 1 < argc) {
+      payload = argv[++i];
     } else if (strcmp(a, "--launcher-abi") == 0 && i + 1 < argc) {
       char* end = NULL;
       launcher_abi = strtoul(argv[++i], &end, 10);
@@ -166,8 +171,13 @@ int main(int argc, char** argv)
   memset(&m, 0, sizeof(m));
   m.version = TPKG_VERSION;
   m.package_flags = lean ? TPKG_FLAG_LEAN : 0;
-  m.slot_count = (uint32_t)nimages;
+  m.slot_count = (uint32_t)(nimages + (payload ? 1 : 0));
   m.launcher_abi = (uint32_t)launcher_abi;
+  if (m.slot_count > TPKG_MAX_SLOTS) {
+    fprintf(stderr, "tpkg-stitch: too many slots (max %u including the runtime payload)\n",
+            (unsigned)TPKG_MAX_SLOTS);
+    return 2;
+  }
   if (strlen(runtime_ref) >= TPKG_RUNTIME_REF_LEN) {
     fprintf(stderr, "tpkg-stitch: runtime_ref too long (max %u)\n", (unsigned)TPKG_RUNTIME_REF_LEN - 1);
     return 2;
@@ -224,7 +234,7 @@ int main(int argc, char** argv)
     }
     size = tbs_lseek(fd_in, 0, SEEK_END);
     off = tbs_lseek(fd_out, 0, SEEK_END);
-    if (size < 0 || off < 0 || copy_fd_contents(fd_in, fd_out) != 0) {
+    if (size < 0 || off < 0 || tbs_lseek(fd_in, 0, SEEK_SET) < 0 || copy_fd_contents(fd_in, fd_out) != 0) {
       fprintf(stderr, "tpkg-stitch: cannot append image %s: %s\n", file, strerror(errno));
       tbs_close(fd_in);
       tbs_close(fd_out);
@@ -236,6 +246,32 @@ int main(int argc, char** argv)
     m.slots[k].format_id = TPKG_FORMAT_AUTO;
     m.slots[k].flags = 0;
     strcpy(m.slots[k].mount_point, colon + 1);
+  }
+
+  /* runtime payload slot (fat package): format_id=RUNTIME, never mounted */
+  if (payload) {
+    int fd_in = tbs_open(payload, O_RDONLY | OPEN_BIN, 0);
+    off64_t off;
+    off64_t size;
+    if (fd_in < 0) {
+      fprintf(stderr, "tpkg-stitch: cannot open runtime payload %s: %s\n", payload, strerror(errno));
+      tbs_close(fd_out);
+      return 1;
+    }
+    size = tbs_lseek(fd_in, 0, SEEK_END);
+    off = tbs_lseek(fd_out, 0, SEEK_END);
+    if (size < 0 || off < 0 || tbs_lseek(fd_in, 0, SEEK_SET) < 0 || copy_fd_contents(fd_in, fd_out) != 0) {
+      fprintf(stderr, "tpkg-stitch: cannot append runtime payload %s: %s\n", payload, strerror(errno));
+      tbs_close(fd_in);
+      tbs_close(fd_out);
+      return 1;
+    }
+    tbs_close(fd_in);
+    m.slots[nimages].offset = (uint64_t)off;
+    m.slots[nimages].size = (uint64_t)size;
+    m.slots[nimages].format_id = TPKG_FORMAT_RUNTIME;
+    m.slots[nimages].flags = 0;
+    m.slots[nimages].mount_point[0] = '\0';
   }
 
   if (tpkg_write_fd(fd_out, &m) != 0) {
