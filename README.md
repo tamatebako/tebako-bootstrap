@@ -84,7 +84,7 @@ parts:
 | Linux glibc x86_64 / arm64 | `linux-gnu-x86_64` / `linux-gnu-arm64` |
 | Linux musl x86_64 / arm64 | `linux-musl-x86_64` / `linux-musl-arm64` |
 | macOS arm64 / x86_64 | `macos-arm64` / `macos-x86_64` |
-| Windows x86_64 | `windows-x86_64` (runtime asset gets `.exe`) |
+| Windows x86_64 (ucrt64) | `windows-ucrt64` (runtime asset gets `.exe`) |
 
 glibc vs musl is decided at compile time (`__GLIBC__`).
 

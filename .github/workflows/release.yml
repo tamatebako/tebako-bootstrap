@@ -73,7 +73,7 @@ jobs:
             os: macos-14
           - platform: macos-x86_64
             os: macos-15-intel
-          - platform: windows-x86_64
+          - platform: windows-ucrt64
             os: windows-latest
 
     steps:

@@ -62,7 +62,7 @@ case $UNAME_S in
       *) fail "unsupported test arch: $UNAME_M" ;;
     esac
     ;;
-  MINGW* | MSYS* | CYGWIN* | Windows_NT) PLAT=windows-x86_64 ;;
+  MINGW* | MSYS* | CYGWIN* | Windows_NT) PLAT=windows-ucrt64 ;;
   *) fail "unsupported test OS: $UNAME_S" ;;
 esac
 

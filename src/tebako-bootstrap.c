@@ -176,11 +176,13 @@ static void sleep_ms(unsigned ms)
 /* ---- platform identity ------------------------------------------------------ */
 
 /* Runtime-package platform string; must match tebako-runtime-ruby's asset
- * naming. glibc vs musl is a compile-time property (__GLIBC__). */
+ * naming. glibc vs musl is a compile-time property (__GLIBC__). The
+ * windows key is the spec 03 §3 axis value `windows-ucrt64` (the ucrt64
+ * toolchain family), shared with tpkg::Platform::release_asset_name. */
 static const char* platform_string(void)
 {
 #if defined(_WIN32)
-  return "windows-x86_64";
+  return "windows-ucrt64";
 #elif defined(__APPLE__)
 #if defined(__aarch64__) || defined(__arm64__)
   return "macos-arm64";

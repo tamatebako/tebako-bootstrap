@@ -48,7 +48,7 @@ jobs:
           - ubuntu-24.04-arm # linux-gnu-arm64
           - macos-14        # macos-arm64
           - macos-15-intel  # macos-x86_64
-          - windows-latest  # windows-x86_64 (MSVC)
+          - windows-latest  # windows-ucrt64 (MSVC)
 
     steps:
       - name: Checkout
