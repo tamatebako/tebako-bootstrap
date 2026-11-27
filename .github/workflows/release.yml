@@ -70,7 +70,7 @@ jobs:
             container: alpine:3.21
             static: 'ON'
           - platform: macos-arm64
-            os: macos-14
+            os: macos-15
           - platform: macos-x86_64
             os: macos-15-intel
           - platform: windows-x86_64
